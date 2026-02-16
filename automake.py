@@ -5,7 +5,8 @@ Random Media Slideshow Generator - FFmpeg Method (Optimized)
 - Generates slideshow video using FFmpeg
 - Auto-imports back to Resolve timeline
 - Handles GIFs, images, and videos
-- NO PIP INSTALL REQUIRED
+- AI UPSCALING with Real-ESRGAN (NVIDIA GPU)
+- NO PIP INSTALL REQUIRED (except for AI upscaling)
 - OPTIMIZED FOR SPEED with parallel processing
 - NO DUPLICATE CLIPS until all are used
 - FULLY HEADLESS - No flashing windows
@@ -22,6 +23,21 @@ from tkinter import ttk, messagebox
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+
+# ---------------------------
+# AI UPSCALING CHECK
+# ---------------------------
+AI_UPSCALING_AVAILABLE = False
+try:
+    import cv2
+    from basicsr.archs.rrdbnet_arch import RRDBNet
+    from realesrgan import RealESRGANer
+    import torch
+    AI_UPSCALING_AVAILABLE = True
+    print("✓ AI Upscaling libraries found (Real-ESRGAN)")
+except ImportError:
+    print("⚠ AI Upscaling not available - install with:")
+    print("  pip install opencv-python torch torchvision realesrgan basicsr")
 
 # ---------------------------
 # HEADLESS SUBPROCESS HELPER
@@ -44,6 +60,164 @@ def run_headless(cmd, timeout=None):
         creationflags=creationflags,
         startupinfo=startupinfo
     )
+
+# ---------------------------
+# AI UPSCALER CLASS
+# ---------------------------
+class AIUpscaler:
+    """Real-ESRGAN AI upscaler for video frames"""
+    
+    def __init__(self, gpu_id=0):
+        self.upsampler = None
+        self.gpu_id = gpu_id
+        
+        if not AI_UPSCALING_AVAILABLE:
+            raise RuntimeError("AI upscaling libraries not installed")
+        
+        # Check CUDA availability
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA not available. AI upscaling requires NVIDIA GPU.")
+        
+        print(f"Initializing Real-ESRGAN AI upscaler (GPU {gpu_id})...")
+        
+        # Download model if needed (will be cached)
+        model_name = 'RealESRGAN_x4plus'  # 4x upscaling
+        model_path = self._get_model_path(model_name)
+        
+        # Initialize model
+        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
+        
+        self.upsampler = RealESRGANer(
+            scale=4,
+            model_path=model_path,
+            model=model,
+            tile=0,  # No tiling for small clips
+            tile_pad=10,
+            pre_pad=0,
+            half=True,  # FP16 for speed on modern GPUs
+            gpu_id=gpu_id
+        )
+        
+        print("✓ AI Upscaler ready!")
+    
+    def _get_model_path(self, model_name):
+        """Get or download model weights"""
+        model_dir = os.path.join(tempfile.gettempdir(), 'realesrgan_models')
+        os.makedirs(model_dir, exist_ok=True)
+        
+        model_path = os.path.join(model_dir, f'{model_name}.pth')
+        
+        if not os.path.exists(model_path):
+            print(f"Downloading {model_name} model (first time only)...")
+            url = f'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/{model_name}.pth'
+            
+            try:
+                import urllib.request
+                urllib.request.urlretrieve(url, model_path)
+                print(f"✓ Model downloaded to {model_path}")
+            except Exception as e:
+                raise RuntimeError(f"Failed to download model: {e}")
+        
+        return model_path
+    
+    def upscale_image(self, img):
+        """Upscale a single image (numpy array)"""
+        try:
+            output, _ = self.upsampler.enhance(img, outscale=4)
+            return output
+        except Exception as e:
+            print(f"⚠ AI upscaling failed: {e}, falling back to original")
+            return img
+    
+    def upscale_video_file(self, input_path, output_path, progress_callback=None):
+        """Upscale a video file frame by frame"""
+        try:
+            # Open video
+            cap = cv2.VideoCapture(input_path)
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            
+            # Get first frame to determine output size
+            ret, first_frame = cap.read()
+            if not ret:
+                raise RuntimeError("Could not read video")
+            
+            upscaled_first = self.upscale_image(first_frame)
+            height, width = upscaled_first.shape[:2]
+            
+            # Reset to beginning
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            
+            # Create temp file for frames
+            temp_frames_dir = tempfile.mkdtemp()
+            
+            try:
+                # Process all frames
+                frame_num = 0
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    
+                    # AI upscale
+                    upscaled = self.upscale_image(frame)
+                    
+                    # Save frame
+                    frame_path = os.path.join(temp_frames_dir, f'frame_{frame_num:06d}.png')
+                    cv2.imwrite(frame_path, upscaled)
+                    
+                    frame_num += 1
+                    
+                    if progress_callback:
+                        progress_callback(frame_num, total_frames)
+                
+                cap.release()
+                
+                # Reassemble video with FFmpeg
+                ffmpeg_path = find_ffmpeg()
+                if not ffmpeg_path:
+                    ffmpeg_path = 'ffmpeg'
+                
+                cmd = [
+                    ffmpeg_path,
+                    '-framerate', str(fps),
+                    '-i', os.path.join(temp_frames_dir, 'frame_%06d.png'),
+                    '-c:v', 'libx264',
+                    '-preset', 'ultrafast',
+                    '-crf', '18',
+                    '-pix_fmt', 'yuv420p',
+                    '-y',
+                    output_path
+                ]
+                
+                result = run_headless(cmd)
+                
+                if result.returncode != 0:
+                    raise RuntimeError(f"FFmpeg failed: {result.stderr}")
+                
+                return True
+                
+            finally:
+                # Clean up temp frames
+                shutil.rmtree(temp_frames_dir, ignore_errors=True)
+                
+        except Exception as e:
+            print(f"✗ AI video upscaling failed: {e}")
+            return False
+
+# Global upscaler instance (lazy init)
+_global_upscaler = None
+
+def get_ai_upscaler(gpu_id=0):
+    """Get or create global AI upscaler instance"""
+    global _global_upscaler
+    if _global_upscaler is None and AI_UPSCALING_AVAILABLE:
+        try:
+            _global_upscaler = AIUpscaler(gpu_id=gpu_id)
+        except Exception as e:
+            print(f"✗ Failed to initialize AI upscaler: {e}")
+            return None
+    return _global_upscaler
 
 # ---------------------------
 # PROGRESS WINDOW
@@ -148,7 +322,7 @@ class ConfigDialog:
         self.result = None
         self.root = tk.Tk()
         self.root.title("Random Slideshow Generator")
-        self.root.geometry("500x400")
+        self.root.geometry("500x500")
         self.root.resizable(False, False)
 
         main_frame = ttk.Frame(self.root, padding="20")
@@ -161,7 +335,7 @@ class ConfigDialog:
         ttk.Label(main_frame, text="Bin Name:").grid(row=1, column=0, sticky="w", pady=8)
         self.bin_entry = ttk.Entry(main_frame, width=30)
         self.bin_entry.grid(row=1, column=1, pady=8)
-        self.bin_entry.insert(0, "Master")
+        self.bin_entry.insert(0, "JJK")
 
         # Interval
         ttk.Label(main_frame, text="Interval (seconds):").grid(row=2, column=0, sticky="w", pady=8)
@@ -205,9 +379,29 @@ class ConfigDialog:
         self.jobs_entry.grid(row=7, column=1, pady=8)
         self.jobs_entry.insert(0, "4")
 
+        # Upscaling method
+        ttk.Label(main_frame, text="Upscaling Method:").grid(row=8, column=0, sticky="w", pady=8)
+        self.upscale_method = tk.StringVar(value="lanczos")
+        method_frame = ttk.Frame(main_frame)
+        method_frame.grid(row=8, column=1, sticky="w", pady=8)
+        
+        ttk.Radiobutton(method_frame, text="None", variable=self.upscale_method, 
+                       value="none").pack(side="left", padx=5)
+        ttk.Radiobutton(method_frame, text="Lanczos", variable=self.upscale_method, 
+                       value="lanczos").pack(side="left", padx=5)
+        
+        ai_state = "normal" if AI_UPSCALING_AVAILABLE else "disabled"
+        ai_radio = ttk.Radiobutton(method_frame, text="AI (GPU)", variable=self.upscale_method, 
+                                   value="ai", state=ai_state)
+        ai_radio.pack(side="left", padx=5)
+        
+        if not AI_UPSCALING_AVAILABLE:
+            ttk.Label(method_frame, text="(install libs)", foreground="red", 
+                     font=('Arial', 8)).pack(side="left")
+
         # Buttons
         button_frame = ttk.Frame(main_frame)
-        button_frame.grid(row=8, column=0, columnspan=2, pady=(15,0))
+        button_frame.grid(row=9, column=0, columnspan=2, pady=(15,0))
         ttk.Button(button_frame, text="Generate & Import", command=self.ok).pack(side="left", padx=5)
         ttk.Button(button_frame, text="Cancel", command=self.cancel).pack(side="left", padx=5)
 
@@ -225,11 +419,16 @@ class ConfigDialog:
             height = int(self.height_entry.get())
             track = int(self.track_entry.get())
             jobs = int(self.jobs_entry.get())
+            upscale_method = self.upscale_method.get()
             
             if not bin_name or interval <= 0 or duration <= 0 or fps <= 0 or jobs <= 0:
                 raise ValueError("Invalid values")
+            
+            if upscale_method == "ai" and not AI_UPSCALING_AVAILABLE:
+                messagebox.showerror("Error", "AI upscaling libraries not installed!")
+                return
                 
-            self.result = (bin_name, interval, duration, fps, width, height, track, jobs)
+            self.result = (bin_name, interval, duration, fps, width, height, track, jobs, upscale_method)
             # Withdraw instead of destroy so we can use it for progress window
             self.root.withdraw()
             self.root.quit()  # Exit mainloop but keep window
@@ -335,6 +534,7 @@ def find_ffmpeg():
 
 # Duration cache to avoid repeated ffprobe calls
 duration_cache = {}
+dimension_cache = {}
 
 def get_media_duration(ffmpeg_path, media_file):
     """Get duration of a media file using ffprobe (with caching)"""
@@ -365,6 +565,35 @@ def get_media_duration(ffmpeg_path, media_file):
     duration_cache[media_file] = 10.0
     return 10.0
 
+def get_media_dimensions(ffmpeg_path, media_file):
+    """Get width and height of a media file using ffprobe (with caching)"""
+    if media_file in dimension_cache:
+        return dimension_cache[media_file]
+    
+    try:
+        ffprobe_path = ffmpeg_path.replace('ffmpeg', 'ffprobe')
+        
+        cmd = [
+            ffprobe_path if os.path.exists(ffprobe_path) else 'ffprobe',
+            '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=width,height',
+            '-of', 'csv=p=0',
+            media_file
+        ]
+        
+        result = run_headless(cmd)
+        if result.returncode == 0 and result.stdout.strip():
+            width, height = map(int, result.stdout.strip().split(','))
+            dimension_cache[media_file] = (width, height)
+            return (width, height)
+    except:
+        pass
+    
+    # Fallback: assume HD
+    dimension_cache[media_file] = (1920, 1080)
+    return (1920, 1080)
+
 def is_video_file(filepath):
     """Check if file is a video (including GIFs)"""
     video_extensions = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.gif', '.m4v', '.flv', '.wmv'}
@@ -386,74 +615,171 @@ def get_random_interval(base_interval, variation_percent=0.10):
 # ---------------------------
 def process_single_clip(args):
     """Process a single clip - designed to run in parallel"""
-    i, media_file, interval, fps, width, height, temp_dir, ffmpeg_path = args
+    i, media_file, interval, fps, width, height, temp_dir, ffmpeg_path, upscale_method = args
     
     temp_output = os.path.join(temp_dir, f"clip_{i:04d}.mp4")
     
     try:
+        # Get input dimensions for upscaling decision
+        input_width, input_height = get_media_dimensions(ffmpeg_path, media_file)
+        needs_upscale = upscale_method != "none" and (input_width < width or input_height < height)
+        
         # Check if it's a video/GIF or image
         if is_video_file(media_file):
-            # Video or GIF - extract random segment
+            # Video or GIF - extract random segment first
             duration = get_media_duration(ffmpeg_path, media_file)
             
             if duration > interval:
-                # Random start time
                 max_start = duration - interval
                 start_time = random.uniform(0, max_start)
             else:
-                # Loop if too short
                 start_time = 0
             
-            cmd = [
+            # Extract segment to temp file
+            temp_segment = os.path.join(temp_dir, f"segment_{i:04d}.mp4")
+            
+            extract_cmd = [
                 ffmpeg_path,
                 '-ss', str(start_time),
                 '-i', media_file,
                 '-t', str(interval),
-                '-vf', f'fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2',
                 '-c:v', 'libx264',
-                '-preset', 'ultrafast',  # FASTER: ultrafast instead of veryfast
-                '-crf', '23',
+                '-preset', 'ultrafast',
+                '-crf', '18',
+                '-pix_fmt', 'yuv420p',
+                '-an',
+                '-y',
+                temp_segment
+            ]
+            
+            result = run_headless(extract_cmd, timeout=30)
+            if result.returncode != 0:
+                return (i, None, f"✗ {os.path.basename(media_file)}: Extract failed")
+            
+            # AI upscale if needed
+            if needs_upscale and upscale_method == "ai":
+                upscaler = get_ai_upscaler()
+                if upscaler:
+                    temp_upscaled = os.path.join(temp_dir, f"upscaled_{i:04d}.mp4")
+                    success = upscaler.upscale_video_file(temp_segment, temp_upscaled)
+                    
+                    if success:
+                        os.remove(temp_segment)
+                        temp_segment = temp_upscaled
+                        upscale_note = " [AI-UPSCALED]"
+                    else:
+                        upscale_note = " [AI-FAILED, FALLBACK]"
+                        needs_upscale = True  # Fall back to Lanczos
+                        upscale_method = "lanczos"
+                else:
+                    upscale_note = " [AI-UNAVAILABLE]"
+                    needs_upscale = True
+                    upscale_method = "lanczos"
+            else:
+                upscale_note = ""
+            
+            # Final resize and padding
+            if needs_upscale and upscale_method == "lanczos":
+                vf = f'scale={width}:{height}:flags=lanczos:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps}'
+                upscale_note = " [LANCZOS]"
+            else:
+                vf = f'fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2'
+            
+            final_cmd = [
+                ffmpeg_path,
+                '-i', temp_segment,
+                '-vf', vf,
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-crf', '18',
                 '-pix_fmt', 'yuv420p',
                 '-an',
                 '-y',
                 temp_output
             ]
+            
+            result = run_headless(final_cmd, timeout=30)
+            
+            # Clean up temp segment
+            try:
+                os.remove(temp_segment)
+            except:
+                pass
+            
+            if result.returncode == 0:
+                return (i, temp_output, f"✓ {os.path.basename(media_file)}{upscale_note}")
+            else:
+                return (i, None, f"✗ {os.path.basename(media_file)}: Processing failed")
         
         elif is_image_file(media_file):
-            # Static image - create video from it
+            # Static image - AI upscale if needed
+            upscale_note = ""
+            source_image = media_file
+            
+            if needs_upscale and upscale_method == "ai":
+                upscaler = get_ai_upscaler()
+                if upscaler:
+                    try:
+                        img = cv2.imread(media_file)
+                        upscaled_img = upscaler.upscale_image(img)
+                        
+                        temp_upscaled_img = os.path.join(temp_dir, f"upscaled_img_{i:04d}.png")
+                        cv2.imwrite(temp_upscaled_img, upscaled_img)
+                        source_image = temp_upscaled_img
+                        upscale_note = " [AI-UPSCALED]"
+                    except Exception as e:
+                        print(f"AI upscale failed for {media_file}: {e}")
+                        upscale_note = " [AI-FAILED, FALLBACK]"
+                        upscale_method = "lanczos"
+            
+            # Create video from image
+            if upscale_method == "lanczos" and needs_upscale:
+                vf = f'scale={width}:{height}:flags=lanczos:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps}'
+                if not upscale_note:
+                    upscale_note = " [LANCZOS]"
+            else:
+                vf = f'fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2'
+            
             cmd = [
                 ffmpeg_path,
                 '-loop', '1',
-                '-i', media_file,
+                '-i', source_image,
                 '-t', str(interval),
-                '-vf', f'fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2',
+                '-vf', vf,
                 '-c:v', 'libx264',
-                '-preset', 'ultrafast',  # FASTER: ultrafast instead of veryfast
-                '-crf', '23',
+                '-preset', 'ultrafast',
+                '-crf', '18',
                 '-pix_fmt', 'yuv420p',
                 '-y',
                 temp_output
             ]
+            
+            result = run_headless(cmd, timeout=30)
+            
+            # Clean up temp upscaled image
+            if source_image != media_file:
+                try:
+                    os.remove(source_image)
+                except:
+                    pass
+            
+            if result.returncode == 0:
+                return (i, temp_output, f"✓ {os.path.basename(media_file)}{upscale_note}")
+            else:
+                return (i, None, f"✗ {os.path.basename(media_file)}: Failed")
         
         else:
             return (i, None, f"Unsupported file type: {os.path.basename(media_file)}")
-        
-        # Run FFmpeg headless
-        result = run_headless(cmd, timeout=30)
-        
-        if result.returncode == 0:
-            return (i, temp_output, f"✓ {os.path.basename(media_file)}")
-        else:
-            error_msg = result.stderr[:200] if result.stderr else "Unknown error"
-            return (i, None, f"✗ {os.path.basename(media_file)}: {error_msg}")
     
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return (i, None, f"✗ {os.path.basename(media_file)}: {str(e)}")
 
 # ---------------------------
 # VIDEO GENERATION WITH FFMPEG (OPTIMIZED)
 # ---------------------------
-def create_slideshow_ffmpeg(clip_paths, interval, total_duration, fps, width, height, output_path, max_workers=4, progress_window=None):
+def create_slideshow_ffmpeg(clip_paths, interval, total_duration, fps, width, height, output_path, max_workers=4, upscale_method="lanczos", progress_window=None):
     """Create slideshow video using FFmpeg with parallel processing"""
     
     ffmpeg_path = find_ffmpeg()
@@ -462,6 +788,14 @@ def create_slideshow_ffmpeg(clip_paths, interval, total_duration, fps, width, he
             "FFmpeg not found!\n\n"
             "Please install FFmpeg or ensure DaVinci Resolve is properly installed.")
         return False
+    
+    # Initialize AI upscaler if needed
+    if upscale_method == "ai":
+        print("\nInitializing AI upscaler...")
+        upscaler = get_ai_upscaler()
+        if not upscaler:
+            messagebox.showerror("Error", "Failed to initialize AI upscaler!")
+            return False
     
     print(f"\n{'='*60}")
     print(f"GENERATING SLIDESHOW VIDEO (OPTIMIZED & HEADLESS)")
@@ -474,6 +808,7 @@ def create_slideshow_ffmpeg(clip_paths, interval, total_duration, fps, width, he
     print(f"FPS: {fps}")
     print(f"Resolution: {width}x{height}")
     print(f"Parallel workers: {max_workers}")
+    print(f"Upscaling: {upscale_method.upper()}")
     print(f"{'='*60}\n")
     
     if progress_window:
@@ -485,7 +820,8 @@ def create_slideshow_ffmpeg(clip_paths, interval, total_duration, fps, width, he
             f"Output: {os.path.basename(output_path)}\n"
             f"FPS: {fps}\n"
             f"Resolution: {width}x{height}\n"
-            f"Parallel workers: {max_workers}"
+            f"Parallel workers: {max_workers}\n"
+            f"Upscaling: {upscale_method.upper()}"
         )
 
         progress_window.set_render_info(render_summary)
@@ -510,7 +846,7 @@ def create_slideshow_ffmpeg(clip_paths, interval, total_duration, fps, width, he
         for i in range(num_clips):
             media_file = clip_selector.get_next_clip()
             varied_interval = get_random_interval(interval, variation_percent=0.10)  # ±10% variance
-            selected_clips.append((i, media_file, varied_interval, fps, width, height, temp_dir, ffmpeg_path))
+            selected_clips.append((i, media_file, varied_interval, fps, width, height, temp_dir, ffmpeg_path, upscale_method))
 
         
         # Show selection stats
@@ -530,6 +866,11 @@ def create_slideshow_ffmpeg(clip_paths, interval, total_duration, fps, width, he
         completed = 0
         
         print(f"Processing {num_clips} clips with {max_workers} parallel workers...\n")
+        
+        # For AI upscaling, use fewer workers to avoid VRAM issues
+        if upscale_method == "ai":
+            max_workers = min(max_workers, 2)
+            print(f"⚠ AI upscaling: reducing workers to {max_workers} to conserve GPU memory\n")
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all jobs
@@ -773,7 +1114,7 @@ def import_to_resolve_timeline(video_path, track_number, progress_window=None):
 # ---------------------------
 def main():
     print("\n" + "="*60)
-    print("RANDOM MEDIA SLIDESHOW GENERATOR (OPTIMIZED & HEADLESS)")
+    print("RANDOM MEDIA SLIDESHOW GENERATOR (AI UPSCALING)")
     print("="*60 + "\n")
     
     # Get Resolve context
@@ -807,7 +1148,7 @@ def main():
             pass
         return
     
-    bin_name, interval, duration, fps, width, height, track, max_workers = dialog.result
+    bin_name, interval, duration, fps, width, height, track, max_workers, upscale_method = dialog.result
     
     # Get clip paths from bin
     print(f"Searching for bin: {bin_name}")
@@ -839,6 +1180,7 @@ def main():
         f"Total clips to render: {num_clips}\n"
         f"Output: {output_filename}\n"
         f"Parallel workers: {max_workers}\n"
+        f"Upscaling: {upscale_method.upper()}\n"
         f"Will auto-import to track {track}")
     
     if not confirm:
@@ -851,6 +1193,7 @@ def main():
     # Generate video with progress updates
     success = create_slideshow_ffmpeg(
         clip_paths, interval, duration, fps, width, height, output_path, max_workers,
+        upscale_method=upscale_method,
         progress_window=progress
     )
     
